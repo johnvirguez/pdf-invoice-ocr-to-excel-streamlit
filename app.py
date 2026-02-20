@@ -2,12 +2,16 @@ import io
 from datetime import datetime
 import pandas as pd
 import streamlit as st
-import pdfplumber
 
 st.set_page_config(page_title="PDF Facturas → Excel", layout="wide")
+st.title("📄➡️📊 PDF Facturas → Excel (sin Azure)")
 
-st.title("📄➡️📊 OCR Básico de Facturas (PDF → Excel)")
-st.caption("Extrae texto de facturas PDF digitales y genera Excel.")
+try:
+    import pdfplumber
+except Exception as e:
+    st.error("No se pudo importar pdfplumber. Revisa requirements.txt / Logs.")
+    st.exception(e)
+    st.stop()
 
 uploaded_files = st.file_uploader(
     "Sube uno o varios PDFs",
@@ -15,47 +19,50 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
-if st.button("🚀 Procesar PDFs"):
-
+if st.button("🚀 Procesar PDFs", type="primary"):
     if not uploaded_files:
         st.error("Sube al menos un archivo PDF.")
         st.stop()
 
-    summary_rows = []
-    progress = st.progress(0)
+    rows = []
+    prog = st.progress(0)
 
-    for idx, file in enumerate(uploaded_files):
+    for i, f in enumerate(uploaded_files, start=1):
         try:
-            with pdfplumber.open(file) as pdf:
-                text = ""
+            with pdfplumber.open(f) as pdf:
+                text_parts = []
                 for page in pdf.pages:
-                    text += page.extract_text() or ""
+                    text_parts.append(page.extract_text() or "")
+                text = "\n".join(text_parts).strip()
 
-            summary_rows.append({
-                "Documento": file.name,
+            rows.append({
+                "Documento": f.name,
                 "Longitud_Texto": len(text),
-                "Preview_Texto": text[:500]
+                "Preview_Texto": text[:800],
+                "Error": ""
             })
-
         except Exception as e:
-            summary_rows.append({
-                "Documento": file.name,
+            rows.append({
+                "Documento": f.name,
+                "Longitud_Texto": "",
+                "Preview_Texto": "",
                 "Error": str(e)
             })
 
-        progress.progress((idx + 1) / len(uploaded_files))
+        prog.progress(i / len(uploaded_files))
 
-    df = pd.DataFrame(summary_rows)
+    df = pd.DataFrame(rows)
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Resumen")
 
-    st.success("Proceso finalizado ✅")
-
+    st.success("✅ Listo")
     st.download_button(
         "⬇️ Descargar Excel",
-        data=output.getvalue(),
+        data=out.getvalue(),
         file_name=f"facturas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+    st.dataframe(df, use_container_width=True)
