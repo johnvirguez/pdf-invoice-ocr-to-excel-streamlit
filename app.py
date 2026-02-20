@@ -15,10 +15,10 @@ from pypdf import PdfReader
 st.set_page_config(page_title="SED | Facturas → Excel (Finanzas)", layout="wide")
 APP_TITLE = "📄➡️📊 SED | Facturas PDF → Excel (Contabilidad / Finanzas)"
 APP_SUBTITLE = (
-    "Extracción desde PDFs digitales (sin OCR). Formato fijo para Contabilidad/Finanzas."
+    "Extracción desde PDFs digitales (sin OCR). Formato fijo para Contabilidad/Finanzas. "
+    "La columna 'Metodo_Extraccion' NO es error; indica qué parser se usó."
 )
 
-# Columnas fijas (Finanzas)
 FIN_COLS = [
     "Documento",
     "Pais",
@@ -103,7 +103,6 @@ def looks_scanned(text: str) -> bool:
 def safe_group(m: Optional[re.Match], idx: int = 1) -> str:
     if not m:
         return ""
-    val = None
     try:
         val = m.group(idx) if m.lastindex and idx <= m.lastindex else m.group(0)
     except Exception:
@@ -124,6 +123,10 @@ def find_first(patterns: List[str], text: str, flags=re.IGNORECASE) -> str:
 
 
 def parse_number_latam(s: str) -> Optional[float]:
+    """
+    - CO común: 1,541,384.13 (miles con coma, decimal con punto)
+    - CR común: 1.541.384,13 o 1,541,384.13 (varía por generador)
+    """
     if not s:
         return None
     raw = s.strip()
@@ -146,65 +149,122 @@ def parse_number_latam(s: str) -> Optional[float]:
         return None
 
 
-def detect_currency_symbol(text: str) -> Tuple[str, str]:
-    """
-    Detecta moneda y símbolo. En tus PDFs aparece '¢' (CRC).
-    """
-    if "¢" in (text or ""):
+def detect_currency(text: str) -> Tuple[str, str]:
+    t = text or ""
+    if " CRC" in t or "Moneda: CRC" in t or "Código Moneda........ CRC" in t:
         return "CRC", "¢"
-    # fallback:
-    cur = find_first([r"\b(COP|USD|EUR|CRC)\b"], text)
-    if cur:
-        sym = {"COP": "$", "USD": "$", "EUR": "€", "CRC": "¢"}.get(cur, "")
-        return cur, sym
+    if " COP" in t or "pesos m/cte" in (t.lower()) or "Bogotá - Colombia" in t:
+        return "COP", "$"
+    # símbolos
+    if "¢" in t:
+        return "CRC", "¢"
+    if "$" in t:
+        return "COP", "$"
     return "", ""
 
 
 # =========================
-# Parser NAVATEC / facturaelectronica.cr (Costa Rica)
+# Format Detectors
 # =========================
-def is_navatec_invoice(text: str) -> bool:
+def is_forlan_co(text: str) -> bool:
     t = (text or "").upper()
-    return ("FACTURA ELECTRÓNICA" in t or "FACTURA ELECTRONICA" in t) and ("FACTURAELECTRONICA.CR" in t or "NAVATE" in t)
+    return "FERRETERIA FORLAN" in t and "FACTURA ELECTR" in t and "TOTAL A PAGAR" in t
 
 
-def parse_navatec_finance(text: str, filename: str) -> FinanceInvoice:
+def is_navatec_cr(text: str) -> bool:
+    t = (text or "").upper()
+    return ("FACTURA ELECTRÓNICA N°" in t or "FACTURA ELECTRONICA N°" in t) and "FACTURAELECTRONICA.CR" in t
+
+
+def is_gustavo_cr(text: str) -> bool:
+    t = (text or "").upper()
+    return "GUSTAVO GAMBOA VILLALOBOS" in t and "FACTURA ELECTRÓNICA #:" in t
+
+
+def is_hacienda_tribu_cr(text: str) -> bool:
+    t = (text or "").upper()
+    return "WWW.HACIENDA.GO.CR" in t and "TRIBU-CR" in t and "COMPROBANTE" in t
+
+
+# =========================
+# Parsers (Finanzas)
+# =========================
+def parse_forlan_co_finance(text: str, filename: str) -> FinanceInvoice:
     scanned = looks_scanned(text)
-    moneda, simbolo = detect_currency_symbol(text)
+    moneda, simbolo = detect_currency(text)
 
-    proveedor = find_first(
-        [
-            r"(?m)^(NAVATEC\s+INGENIERIA\s+S\.A\.)\s*$",
-            r"(?m)^(NAVATECO)\s*$",
-        ],
-        text,
+    proveedor = find_first([r"(?m)^(FERRETERIA\s+FORLAN\s+SAS)\s*$"], text)
+    proveedor_id = find_first([r"NIT\s*([0-9\.\-]+)"], text)
+
+    cliente = find_first([r"Señores\s+([A-ZÁÉÍÓÚÑ0-9\.\s&\-]+)"], text)
+    cliente_nit = find_first([r"Señores.*?\nNIT\s*([0-9\.\-]+)"], text)
+
+    # "No. FO 16498" -> prefijo FO + número
+    prefijo = find_first([r"No\.\s*([A-Z]{1,5})\s*\n*\s*([0-9]{3,})"], text)
+    # El find_first no maneja 2 grupos; hacemos match directo:
+    m = re.search(r"No\.\s*([A-Z]{1,5})\s*\n*\s*([0-9]{3,})", text, re.IGNORECASE)
+    factura_num = f"{m.group(1)} {m.group(2)}".strip() if m else ""
+
+    # Fecha: "Generación 16/02/2026, 14:53"
+    fecha = find_first([r"Generaci[oó]n\s*([0-3]\d\/[01]\d\/[12]\d{3},\s*[0-2]\d:[0-5]\d)"], text)
+
+    condicion = find_first([r"Forma\s+de\s+pago:\s*\n*([A-Za-zÁÉÍÓÚÑ\s]+)"], text)
+    medio = find_first([r"Medio\s+de\s+pago:\s*\n*([A-Za-zÁÉÍÓÚÑ\s\-]+)"], text)
+
+    # Montos
+    subtotal_str = find_first([r"Total\s+Bruto\s*([0-9\.,]+)"], text)
+    iva_str = find_first([r"IVA\s*19%\s*([0-9\.,]+)"], text)
+    total_str = find_first([r"Total\s+a\s+Pagar\s*([0-9\.,]+)"], text)
+
+    # OC / CUFE
+    oc = find_first([r"Oc:\s*(OC[0-9]+)"], text)
+    cufe = find_first([r"CUFE:\s*([a-f0-9]{20,})"], text)
+
+    inv = FinanceInvoice(
+        Documento=filename,
+        Pais="CO",
+        Tipo_Documento="Factura",
+        Proveedor_Razon_Social=proveedor,
+        Proveedor_Id_Tributaria=proveedor_id,
+        Cliente_Razon_Social=cliente,
+        Cliente_Id_Tributaria=cliente_nit,
+        Factura_Numero=factura_num,
+        Fecha_Emision=fecha,
+        Condicion_Venta=condicion,
+        Medio_Pago=medio,
+        Moneda=moneda or "COP",
+        Simbolo_Moneda=simbolo or "$",
+        Subtotal=parse_number_latam(subtotal_str),
+        Impuesto_IVA=parse_number_latam(iva_str),
+        Total_Factura=parse_number_latam(total_str),
+        Anticipo=None,
+        Saldo=None,
+        Clave_Numerica=oc,                 # en CO usamos este campo para OC (para finanzas es útil)
+        Codigo_Unico_Consulta=cufe,        # guardamos CUFE aquí
+        Probable_Escaneado="SI" if scanned else "NO",
+        Metodo_Extraccion="FORLAN CO (reglas finanzas)",
+        Error="",
     )
+    return inv
 
-    # En el PDF aparece "Ident. Jurídica: 3-101-861442" (emisor) y luego otra para receptor.
-    proveedor_id = find_first([r"Ident\.\s*Jur[ií]dica:\s*([0-9\-]+)"], text)
 
-    # Cliente / Receptor
+def parse_navatec_cr_finance(text: str, filename: str) -> FinanceInvoice:
+    scanned = looks_scanned(text)
+    moneda, simbolo = detect_currency(text)
+
+    proveedor = find_first([r"(?m)^(NAVATEC\s+INGENIERIA\s+S\.A\.)\s*$", r"(?m)^(NAVATECO)\s*$"], text)
+    ids = re.findall(r"Ident\.\s*Jur[ií]dica:\s*([0-9\-]+)", text, flags=re.IGNORECASE)
+    proveedor_id = (ids[0] if len(ids) >= 1 else "").strip()
+    cliente_id = (ids[1] if len(ids) >= 2 else "").strip()
+
     cliente = find_first([r"Receptor\s+([A-ZÁÉÍÓÚÑ0-9\.\s&\-]+)"], text)
-    cliente_id = ""
-    # buscar "Receptor ... Ident. Jurídica: xxxx" cercano es complejo; dejamos la 2da ocurrencia si existe
-    all_ids = re.findall(r"Ident\.\s*Jur[ií]dica:\s*([0-9\-]+)", text, flags=re.IGNORECASE)
-    if len(all_ids) >= 2:
-        cliente_id = (all_ids[1] or "").strip()
 
     factura_num = find_first([r"Factura\s+Electr[oó]nica\s+N°\s*([0-9]+)"], text)
-
-    fecha = find_first(
-        [
-            r"Fecha\s+de\s+Emisi[oó]n:\s*([0-9]{2}\/[0-9]{2}\/[0-9]{4}\s+[0-9:]+\s*[ap]\.m\.)",
-            r"Fecha\s+de\s+Emisi[oó]n:\s*([0-9]{2}\/[0-9]{2}\/[0-9]{4})",
-        ],
-        text,
-    )
-
+    fecha = find_first([r"Fecha\s+de\s+Emisi[oó]n:\s*([0-3]\d\/[01]\d\/[12]\d{3}\s+[0-2]\d:[0-5]\d\s*[ap]\.m\.)"], text)
     condicion = find_first([r"Condici[oó]n\s+de\s+venta:\s*([A-Za-zÁÉÍÓÚÑ\s]+)"], text)
-    medio_pago = find_first([r"Medio\s+de\s+Pago:\s*([A-Za-zÁÉÍÓÚÑ\s]+)"], text)
+    medio = find_first([r"Medio\s+de\s+Pago:\s*([A-Za-zÁÉÍÓÚÑ\s]+)"], text)
 
-    clave_numerica = find_first([r"Clave\s+Num[eé]rica:\s*\n*([0-9]{30,})"], text)
+    clave = find_first([r"Clave\s+Num[eé]rica:\s*\n*([0-9]{30,})"], text)
     cod_unico = find_first([r"C[oó]digo\s+Único\s+de\s+Consulta:\s*([A-Z0-9]+)"], text)
 
     subtotal_str = find_first([r"Subtotal\s+Neto\s*¢\s*([0-9\.,]+)"], text)
@@ -213,7 +273,7 @@ def parse_navatec_finance(text: str, filename: str) -> FinanceInvoice:
     anticipo_str = find_first([r"ANTICIPO\s*¢\s*([0-9\.,]+)"], text)
     saldo_str = find_first([r"SALDO\s*¢\s*([0-9\.,]+)"], text)
 
-    inv = FinanceInvoice(
+    return FinanceInvoice(
         Documento=filename,
         Pais="CR",
         Tipo_Documento="Factura",
@@ -224,29 +284,121 @@ def parse_navatec_finance(text: str, filename: str) -> FinanceInvoice:
         Factura_Numero=factura_num,
         Fecha_Emision=fecha,
         Condicion_Venta=condicion,
-        Medio_Pago=medio_pago,
-        Moneda=moneda,
-        Simbolo_Moneda=simbolo,
+        Medio_Pago=medio,
+        Moneda=moneda or "CRC",
+        Simbolo_Moneda=simbolo or "¢",
         Subtotal=parse_number_latam(subtotal_str),
         Impuesto_IVA=parse_number_latam(iva_str),
         Total_Factura=parse_number_latam(total_str),
         Anticipo=parse_number_latam(anticipo_str),
         Saldo=parse_number_latam(saldo_str),
-        Clave_Numerica=clave_numerica,
+        Clave_Numerica=clave,
         Codigo_Unico_Consulta=cod_unico,
         Probable_Escaneado="SI" if scanned else "NO",
-        Metodo_Extraccion="NAVATEC (reglas finanzas)",
+        Metodo_Extraccion="NAVATEC CR (reglas finanzas)",
         Error="",
     )
-    return inv
 
 
-# =========================
-# Generic fallback (Finanzas)
-# =========================
+def parse_gustavo_cr_finance(text: str, filename: str) -> FinanceInvoice:
+    scanned = looks_scanned(text)
+    moneda, simbolo = detect_currency(text)
+
+    proveedor = find_first([r"Raz[oó]n\s+Social:\s*([^\n,]+)"], text)
+    proveedor_id = find_first([r"C[eé]dula\s+F[ií]sica:\s*([0-9]+)"], text)
+
+    cliente = find_first([r"Señor\(es\):\s*([A-ZÁÉÍÓÚÑ0-9\.\s&\-]+)"], text)
+    cliente_id = find_first([r"Identificaci[oó]n:.*?\n*([0-9]{8,})"], text)
+
+    factura_num = find_first([r"Factura\s+Electr[oó]nica\s*#:\s*([0-9]+)"], text)
+    clave = find_first([r"Clave\s+Num[eé]rica\s*#:\s*([0-9]{30,})"], text)
+    fecha = find_first([r"Fecha\s+y\s+Hora\s+de\s+Emisi[oó]n:\s*([0-3]\d\/[01]\d\/[12]\d{3}\s+[0-2]\d:[0-5]\d:[0-5]\d\s*[AP]M)"], text)
+
+    condicion = find_first([r"Condici[oó]n\s+de\s+Venta:\s*([A-Za-zÁÉÍÓÚÑ\s]+)"], text)
+
+    subtotal_str = find_first([r"Subtotal\s+Neto:\s*CRC\s*([0-9\.,]+)"], text)
+    iva_str = find_first([r"Total\s+Impuestos:\s*CRC\s*([0-9\.,]+)"], text)
+    total_str = find_first([r"Total\s+Factura:\s*CRC\s*([0-9\.,]+)"], text)
+
+    return FinanceInvoice(
+        Documento=filename,
+        Pais="CR",
+        Tipo_Documento="Factura",
+        Proveedor_Razon_Social=proveedor,
+        Proveedor_Id_Tributaria=proveedor_id,
+        Cliente_Razon_Social=cliente,
+        Cliente_Id_Tributaria=cliente_id,
+        Factura_Numero=factura_num,
+        Fecha_Emision=fecha,
+        Condicion_Venta=condicion,
+        Medio_Pago="",
+        Moneda=moneda or "CRC",
+        Simbolo_Moneda=simbolo or "¢",
+        Subtotal=parse_number_latam(subtotal_str),
+        Impuesto_IVA=parse_number_latam(iva_str),
+        Total_Factura=parse_number_latam(total_str),
+        Anticipo=None,
+        Saldo=None,
+        Clave_Numerica=clave,
+        Codigo_Unico_Consulta="",
+        Probable_Escaneado="SI" if scanned else "NO",
+        Metodo_Extraccion="GUSTAVO CR (reglas finanzas)",
+        Error="",
+    )
+
+
+def parse_hacienda_tribu_cr_finance(text: str, filename: str) -> FinanceInvoice:
+    scanned = looks_scanned(text)
+    moneda, simbolo = detect_currency(text)
+
+    proveedor = find_first([r"Nombre:\s*([A-ZÁÉÍÓÚÑ\s]+)\nNombre comercial:"], text)
+    proveedor_id = find_first([r"C[eé]dula:\s*([0-9]+)"], text)
+
+    cliente = find_first([r"DATOS\s+DEL\s+CLIENTE\s+Nombre:\s*([A-ZÁÉÍÓÚÑ\s]+)"], text)
+    cliente_id = find_first([r"DATOS\s+DEL\s+CLIENTE.*?C[eé]dula:\s*([0-9]+)"], text)
+
+    consecutivo = find_first([r"Consecutivo:\s*([0-9]+)"], text)
+    clave = find_first([r"Clave:\s*([0-9]{30,})"], text)
+    fecha = find_first([r"Fecha:\s*([0-3]\d\/[01]\d\/[12]\d{3}\s+[0-2]\d:[0-5]\d:[0-5]\d)"], text)
+
+    condicion = find_first([r"Condici[oó]n\s+de\s+Venta:\s*([A-Za-zÁÉÍÓÚÑ\s]+)"], text)
+    medio = find_first([r"Medio\s+de\s+Pago:\s*([A-Za-zÁÉÍÓÚÑ\s\-]+)"], text)
+
+    # Totales (en página 2 suele estar)
+    subtotal_str = find_first([r"Total\s+venta\s+neta\s*([0-9\.,]+)"], text)
+    iva_str = find_first([r"Total\s+impuestos\s*([0-9\.,]+)"], text)
+    total_str = find_first([r"Total\s+comprobante\s*([0-9\.,]+)"], text)
+
+    return FinanceInvoice(
+        Documento=filename,
+        Pais="CR",
+        Tipo_Documento="Factura",
+        Proveedor_Razon_Social=proveedor,
+        Proveedor_Id_Tributaria=proveedor_id,
+        Cliente_Razon_Social=cliente,
+        Cliente_Id_Tributaria=cliente_id,
+        Factura_Numero=consecutivo,
+        Fecha_Emision=fecha,
+        Condicion_Venta=condicion,
+        Medio_Pago=medio,
+        Moneda=moneda or "CRC",
+        Simbolo_Moneda=simbolo or "¢",
+        Subtotal=parse_number_latam(subtotal_str),
+        Impuesto_IVA=parse_number_latam(iva_str),
+        Total_Factura=parse_number_latam(total_str),
+        Anticipo=None,
+        Saldo=None,
+        Clave_Numerica=clave,
+        Codigo_Unico_Consulta="",
+        Probable_Escaneado="SI" if scanned else "NO",
+        Metodo_Extraccion="HACIENDA TRIBU-CR (reglas finanzas)",
+        Error="",
+    )
+
+
 def parse_generic_finance(text: str, filename: str) -> FinanceInvoice:
     scanned = looks_scanned(text)
-    moneda, simbolo = detect_currency_symbol(text)
+    moneda, simbolo = detect_currency(text)
 
     proveedor = find_first(
         [
@@ -262,6 +414,7 @@ def parse_generic_finance(text: str, filename: str) -> FinanceInvoice:
             r"NIT[:\s]*([0-9\.\-]{6,20})",
             r"N\.I\.T\.[:\s]*([0-9\.\-]{6,20})",
             r"Ident\.\s*Jur[ií]dica:\s*([0-9\-]+)",
+            r"C[eé]dula:\s*([0-9]+)",
         ],
         text,
     )
@@ -270,6 +423,7 @@ def parse_generic_finance(text: str, filename: str) -> FinanceInvoice:
         [
             r"Factura\s*(?:No\.|Nro\.|N°|#)?\s*[:\s]*([A-Z0-9\-]{3,})",
             r"Invoice\s*(?:No\.|Number)?\s*[:\s]*([A-Z0-9\-]{3,})",
+            r"Consecutivo:\s*([0-9]+)",
         ],
         text,
     )
@@ -277,15 +431,16 @@ def parse_generic_finance(text: str, filename: str) -> FinanceInvoice:
     fecha = find_first(
         [
             r"Fecha\s*(?:de\s*Emisi[oó]n)?[:\s]*([0-3]?\d[\/\-][01]?\d[\/\-][12]\d{3})",
+            r"Fecha:\s*([0-3]\d\/[01]\d\/[12]\d{3}\s+[0-2]\d:[0-5]\d:[0-5]\d)",
         ],
         text,
     )
 
-    subtotal_str = find_first([r"Subtotal[:\s\$]*([0-9\.\,]+)"], text)
-    iva_str = find_first([r"IVA[:\s\$]*([0-9\.\,]+)"], text)
-    total_str = find_first([r"Total[:\s\$]*([0-9\.\,]+)"], text)
+    subtotal_str = find_first([r"Subtotal[:\s\$]*([0-9\.\,]+)", r"Total\s+Bruto\s*([0-9\.,]+)"], text)
+    iva_str = find_first([r"IVA[:\s\$]*([0-9\.\,]+)", r"Total\s+impuestos\s*([0-9\.,]+)"], text)
+    total_str = find_first([r"Total[:\s\$]*([0-9\.\,]+)", r"Total\s+a\s+Pagar\s*([0-9\.,]+)"], text)
 
-    inv = FinanceInvoice(
+    return FinanceInvoice(
         Documento=filename,
         Pais="",
         Tipo_Documento="Factura",
@@ -310,7 +465,6 @@ def parse_generic_finance(text: str, filename: str) -> FinanceInvoice:
         Metodo_Extraccion="Genérico (heurístico finanzas)",
         Error="",
     )
-    return inv
 
 
 # =========================
@@ -333,7 +487,7 @@ st.caption(APP_SUBTITLE)
 with st.sidebar:
     st.header("⚙️ Opciones")
     show_audit = st.checkbox("Incluir hoja de auditoría (texto extraído)", value=True)
-    max_audit_chars = st.slider("Máximo texto por documento (auditoría)", 2000, 32000, 15000, 500)
+    max_audit_chars = st.slider("Máximo texto por documento (auditoría)", 2000, 32000, 12000, 500)
 
 st.divider()
 
@@ -364,13 +518,18 @@ if process:
         try:
             text = extract_text_pypdf(pdf_bytes)
 
-            if is_navatec_invoice(text):
-                inv = parse_navatec_finance(text, uf.name)
+            if is_forlan_co(text):
+                inv = parse_forlan_co_finance(text, uf.name)
+            elif is_navatec_cr(text):
+                inv = parse_navatec_cr_finance(text, uf.name)
+            elif is_gustavo_cr(text):
+                inv = parse_gustavo_cr_finance(text, uf.name)
+            elif is_hacienda_tribu_cr(text):
+                inv = parse_hacienda_tribu_cr_finance(text, uf.name)
             else:
                 inv = parse_generic_finance(text, uf.name)
 
             row = inv.__dict__
-            # Garantiza columnas fijas
             fin_rows.append({c: row.get(c, "") for c in FIN_COLS})
 
             if show_audit:
@@ -390,9 +549,7 @@ if process:
             fin_rows.append(err_row)
 
             if show_audit:
-                audit_rows.append(
-                    {"Documento": uf.name, "Longitud_Texto": 0, "Texto": f"ERROR: {e}"}
-                )
+                audit_rows.append({"Documento": uf.name, "Longitud_Texto": 0, "Texto": f"ERROR: {e}"})
 
         prog.progress(int((idx / total_files) * 100))
 
@@ -408,7 +565,7 @@ if process:
     if scanned_count:
         st.warning(
             f"Detecté **{scanned_count}** PDF(s) con muy poco texto (probablemente escaneados). "
-            "Sin OCR, esos archivos no se pueden capturar bien."
+            "Sin OCR, esos archivos no se capturan bien."
         )
 
     excel_bytes = build_excel_bytes(df_fin, df_audit) if show_audit else build_excel_bytes(df_fin, pd.DataFrame())
@@ -421,4 +578,3 @@ if process:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
-
