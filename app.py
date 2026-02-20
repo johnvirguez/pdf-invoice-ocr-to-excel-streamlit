@@ -1,68 +1,26 @@
-import io
-from datetime import datetime
-import pandas as pd
 import streamlit as st
+import pandas as pd
 
-st.set_page_config(page_title="PDF Facturas → Excel", layout="wide")
-st.title("📄➡️📊 PDF Facturas → Excel (sin Azure)")
+st.set_page_config(page_title="Mi primera aplicación", layout="wide")
 
-try:
-    import pdfplumber
-except Exception as e:
-    st.error("No se pudo importar pdfplumber. Revisa requirements.txt / Logs.")
-    st.exception(e)
-    st.stop()
+st.title("🚀 Mi primera aplicación web en Streamlit")
 
-uploaded_files = st.file_uploader(
-    "Sube uno o varios PDFs",
-    type=["pdf"],
-    accept_multiple_files=True,
-)
+st.write("Escribe tu nombre y genera una gráfica simple.")
 
-if st.button("🚀 Procesar PDFs", type="primary"):
-    if not uploaded_files:
-        st.error("Sube al menos un archivo PDF.")
-        st.stop()
+# Entrada de usuario
+nombre = st.text_input("Escribe tu nombre")
 
-    rows = []
-    prog = st.progress(0)
+if nombre:
+    st.success(f"Hola {nombre}, bienvenido a tu primera app en la nube ☁️")
 
-    for i, f in enumerate(uploaded_files, start=1):
-        try:
-            with pdfplumber.open(f) as pdf:
-                text_parts = []
-                for page in pdf.pages:
-                    text_parts.append(page.extract_text() or "")
-                text = "\n".join(text_parts).strip()
+    # Datos de ejemplo
+    data = pd.DataFrame({
+        "Mes": ["Enero", "Febrero", "Marzo", "Abril", "Mayo"],
+        "Ventas": [100, 150, 80, 200, 170]
+    })
 
-            rows.append({
-                "Documento": f.name,
-                "Longitud_Texto": len(text),
-                "Preview_Texto": text[:800],
-                "Error": ""
-            })
-        except Exception as e:
-            rows.append({
-                "Documento": f.name,
-                "Longitud_Texto": "",
-                "Preview_Texto": "",
-                "Error": str(e)
-            })
+    st.subheader("📊 Ejemplo de gráfico (sin matplotlib)")
+    st.line_chart(data.set_index("Mes"))
 
-        prog.progress(i / len(uploaded_files))
-
-    df = pd.DataFrame(rows)
-
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Resumen")
-
-    st.success("✅ Listo")
-    st.download_button(
-        "⬇️ Descargar Excel",
-        data=out.getvalue(),
-        file_name=f"facturas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-    st.dataframe(df, use_container_width=True)
+    st.subheader("📋 Datos utilizados")
+    st.dataframe(data, use_container_width=True)
