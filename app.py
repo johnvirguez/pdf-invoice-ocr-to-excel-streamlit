@@ -8,6 +8,10 @@ import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
 
+from openpyxl import load_workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
+
 
 # =========================
 # App Config
@@ -16,11 +20,11 @@ st.set_page_config(page_title="SED | Facturas → Excel (Finanzas CO + Líneas)"
 APP_TITLE = "📄➡️📊 SED | Facturas PDF → Excel (Contabilidad Colombia + Líneas)"
 APP_SUBTITLE = (
     "Extracción desde PDFs digitales (sin OCR). "
-    "Genera encabezado (totales) + todas las líneas de factura. "
-    "Incluye columnas para marcar costo."
+    "Genera encabezado (totales) + todas las líneas. "
+    "Excel final: sin cuadrícula, fuente Century Gothic 10 y líneas agrupadas por factura."
 )
 
-# Encabezado (1 fila por factura) - Contabilidad CO + compatibilidad CR
+# Encabezado (1 fila por factura)
 FIN_COLS = [
     "Documento",
     "Pais",
@@ -49,15 +53,16 @@ FIN_COLS = [
     "Codigo_Unico_Consulta",
     "Anticipo",
     "Saldo",
-    # NUEVO: marcar costo a nivel factura
+    # para marcar costo a nivel factura
     "Costo_Factura_Marcado",
     "Probable_Escaneado",
     "Metodo_Extraccion",
     "Error",
 ]
 
-# Líneas (múltiples filas por factura)
+# Líneas (múltiples filas por factura) — incluir Factura_Numero para agrupar
 LINE_COLS = [
+    "Factura_Numero",
     "Documento",
     "Linea",
     "Codigo_Item",
@@ -71,10 +76,10 @@ LINE_COLS = [
     "Total_Linea",
     "Moneda",
     "Pais",
-    # NUEVO: columnas para marcar costo por línea
+    # columnas para marcar costo por línea
     "Marca_Costo",
     "Cuenta_Costo",
-    "Descripcion_Raw",  # respaldo por si falla el parsing fino
+    "Descripcion_Raw",
 ]
 
 
@@ -86,31 +91,39 @@ class FinanceInvoice:
     Documento: str
     Pais: str = ""
     Tipo_Documento: str = "Factura"
+
     Proveedor_Razon_Social: str = ""
     Proveedor_Id_Tributaria: str = ""
     Cliente_Razon_Social: str = ""
     Cliente_Id_Tributaria: str = ""
+
     Prefijo: str = ""
     Factura_Numero: str = ""
     Consecutivo: str = ""
     Fecha_Emision: str = ""
+
     Condicion_Venta: str = ""
     Forma_Pago: str = ""
     Medio_Pago: str = ""
+
     Moneda: str = ""
     Simbolo_Moneda: str = ""
     Subtotal: Optional[float] = None
     Impuesto_IVA: Optional[float] = None
     Total_Factura: Optional[float] = None
+
     OC: str = ""
     CUFE: str = ""
     Resolucion_DIAN: str = ""
     QR_o_Codigo: str = ""
+
     Clave_Numerica: str = ""
     Codigo_Unico_Consulta: str = ""
+
     Anticipo: Optional[float] = None
     Saldo: Optional[float] = None
-    Costo_Factura_Marcado: str = ""  # para diligenciar después
+
+    Costo_Factura_Marcado: str = ""
     Probable_Escaneado: str = ""
     Metodo_Extraccion: str = ""
     Error: str = ""
@@ -173,13 +186,10 @@ def parse_number_latam(s: str) -> Optional[float]:
     last_comma = raw.rfind(",")
     last_dot = raw.rfind(".")
 
-    # decimal separator = the last of comma/dot
     if last_comma > last_dot:
-        # comma decimal, dots thousands
         raw = raw.replace(".", "")
         raw = raw.replace(",", ".")
     else:
-        # dot decimal, commas thousands
         raw = raw.replace(",", "")
 
     try:
@@ -197,31 +207,8 @@ def detect_currency(text: str) -> Tuple[str, str]:
     return "", ""
 
 
-def consolidate_wrapped_lines(lines: List[str]) -> List[str]:
-    """
-    Une líneas partidas (muy común en PDFs) para mejorar parsing de ítems.
-    Heurística:
-      - Si una línea NO empieza con código de ítem, y la anterior parece parte de ítem,
-        se concatena.
-    """
-    out: List[str] = []
-    for line in lines:
-        s = (line or "").strip()
-        if not s:
-            continue
-
-        starts_item = bool(re.match(r"^\d{3}\s+\d", s))  # NAVATEC: 001 1.00 ...
-        # Para Colombia, a veces el ítem no inicia con 001; dejamos fallback abajo.
-        if out and not starts_item:
-            # Si la anterior parece ítem (tiene números al final), une
-            prev = out[-1]
-            if re.search(r"([0-9][0-9\.,]+)\s*$", prev) or re.match(r"^\d{3}\s+\d", prev.strip()):
-                out[-1] = prev + " " + s
-            else:
-                out.append(s)
-        else:
-            out.append(s)
-    return out
+def lines(text: str) -> List[str]:
+    return [ln.strip() for ln in (text or "").splitlines() if (ln or "").strip()]
 
 
 # =========================
@@ -229,7 +216,7 @@ def consolidate_wrapped_lines(lines: List[str]) -> List[str]:
 # =========================
 def is_forlan_co(text: str) -> bool:
     t = (text or "").upper()
-    return "FERRETERIA FORLAN" in t and "FACTURA ELECTR" in t and "TOTAL A PAGAR" in t
+    return "FERRETERIA FORLAN" in t and "FACTURA ELECTR" in t and "VR." in t and "TOTAL A PAGAR" in t
 
 
 def is_navatec_cr(text: str) -> bool:
@@ -237,160 +224,35 @@ def is_navatec_cr(text: str) -> bool:
     return ("FACTURA ELECTRÓNICA N°" in t or "FACTURA ELECTRONICA N°" in t) and "FACTURAELECTRONICA.CR" in t
 
 
-def is_gustavo_cr(text: str) -> bool:
-    t = (text or "").upper()
-    return "GUSTAVO GAMBOA VILLALOBOS" in t and ("RESUMEN DEL DOCUMENTO" in t or "FACTURA ELECTRÓNICA #:" in t)
-
-
-def is_hacienda_tribu_cr(text: str) -> bool:
+def is_tribu_cr_hacienda(text: str) -> bool:
     t = (text or "").upper()
     return "WWW.HACIENDA.GO.CR" in t and "TRIBU-CR" in t and "COMPROBANTE" in t
 
 
-# =========================
-# Line Items Extractors
-# =========================
-def extract_items_navatec(text: str, doc: str, pais: str, moneda: str) -> List[Dict[str, Any]]:
-    """
-    NAVATEC / facturaelectronica.cr: líneas estilo
-      001 1.00 Unid MTR001 EL COCO ALAJUELA 741,300.84 0.00 741.300,84 96,369.11
-    Captura:
-      - Linea (001)
-      - Cantidad (1.00)
-      - Unidad (Unid)
-      - Codigo_Item (MTR001)
-      - Descripcion (...)
-      - Precio_Unitario
-      - Descuento
-      - Subtotal_Linea
-      - Impuesto_Linea
-    """
-    raw_lines = consolidate_wrapped_lines((text or "").splitlines())
-    items: List[Dict[str, Any]] = []
-
-    pat = re.compile(
-        r"^(?P<linea>\d{3})\s+"
-        r"(?P<cantidad>\d+(?:\.\d+)?)\s+"
-        r"(?P<unidad>\w+)\s+"
-        r"(?P<codigo>[A-Z0-9]+)\s+"
-        r"(?P<desc>.+?)\s+"
-        r"(?P<precio>[0-9\.,]+)\s+"
-        r"(?P<descuento>[0-9\.,]+)\s+"
-        r"(?P<subtotal>[0-9\.,]+)\s+"
-        r"(?P<imp>[0-9\.,]+)\s*$"
-    )
-
-    for ln in raw_lines:
-        m = pat.match(ln)
-        if not m:
-            continue
-
-        cantidad = parse_number_latam(m.group("cantidad"))
-        precio = parse_number_latam(m.group("precio"))
-        descuento = parse_number_latam(m.group("descuento"))
-        subtotal_linea = parse_number_latam(m.group("subtotal"))
-        impuesto_linea = parse_number_latam(m.group("imp"))
-        total_linea = None
-        if subtotal_linea is not None and impuesto_linea is not None:
-            total_linea = subtotal_linea + impuesto_linea
-
-        items.append(
-            {
-                "Documento": doc,
-                "Linea": m.group("linea"),
-                "Codigo_Item": m.group("codigo"),
-                "Descripcion": m.group("desc").strip(),
-                "Cantidad": cantidad,
-                "Unidad": m.group("unidad"),
-                "Precio_Unitario": precio,
-                "Descuento": descuento,
-                "Subtotal_Linea": subtotal_linea,
-                "Impuesto_Linea": impuesto_linea,
-                "Total_Linea": total_linea,
-                "Moneda": moneda,
-                "Pais": pais,
-                "Marca_Costo": "",
-                "Cuenta_Costo": "",
-                "Descripcion_Raw": ln,
-            }
-        )
-
-    return items
+def is_ciclo_huracan(text: str) -> bool:
+    t = (text or "").upper()
+    return "CICLO HURACAN" in t and "NO COD PRODUCTO" in t and "TOTAL DE LÍNEA" in t
 
 
-def extract_items_generic(text: str, doc: str, pais: str, moneda: str) -> List[Dict[str, Any]]:
-    """
-    Extractor genérico (best-effort) para PDFs CO u otros donde no haya formato fijo.
-    Objetivo: no perder info.
-    Heurística: líneas que terminen con 1 o más valores numéricos.
-    Si detecta 2 valores al final, asume (Subtotal_Linea, Impuesto_Linea) o (Precio, Total).
-    """
-    raw_lines = consolidate_wrapped_lines((text or "").splitlines())
-    items: List[Dict[str, Any]] = []
+def is_brujo_caribeno(text: str) -> bool:
+    t = (text or "").upper()
+    return "EL BRUJO CARIBEÑO" in t and "CÓDIGO UNIDAD CANTIDAD PRECIO" in t
 
-    # Captura hasta 3 números al final de la línea
-    tail_nums = re.compile(r"^(?P<body>.*?)(?P<n1>[0-9][0-9\.,]+)\s+(?P<n2>[0-9][0-9\.,]+)(?:\s+(?P<n3>[0-9][0-9\.,]+))?\s*$")
 
-    line_no = 0
-    for ln in raw_lines:
-        s = (ln or "").strip()
+def is_erial_office_depot(text: str) -> bool:
+    t = (text or "").upper()
+    return "ERIAL BQ" in t and "LINEA SKU" in t and "PRECIO" in t and "IMPUESTO" in t
 
-        # Filtra encabezados comunes
-        if len(s) < 8:
-            continue
-        if any(k in s.upper() for k in ["SUBTOTAL", "TOTAL", "IVA", "CUFE", "RESOLU", "CLAVE", "PÁGINA", "PAGINA", "AUTORIZADO"]):
-            continue
 
-        m = tail_nums.match(s)
-        if not m:
-            continue
-
-        line_no += 1
-        body = m.group("body").strip()
-        n1 = parse_number_latam(m.group("n1"))
-        n2 = parse_number_latam(m.group("n2"))
-        n3 = parse_number_latam(m.group("n3")) if m.group("n3") else None
-
-        # Asignación tentativa:
-        # Si hay 3 números: precio, subtotal, impuesto (muy tentativo)
-        precio = n1 if n3 is not None else None
-        subtotal_linea = n2 if n3 is not None else n1
-        impuesto_linea = n3 if n3 is not None else None
-        total_linea = None
-        if subtotal_linea is not None and impuesto_linea is not None:
-            total_linea = subtotal_linea + impuesto_linea
-        elif n2 is not None and n1 is not None and total_linea is None:
-            # fallback: el último podría ser total
-            total_linea = n2
-
-        items.append(
-            {
-                "Documento": doc,
-                "Linea": str(line_no),
-                "Codigo_Item": "",
-                "Descripcion": body[:250],
-                "Cantidad": None,
-                "Unidad": "",
-                "Precio_Unitario": precio,
-                "Descuento": None,
-                "Subtotal_Linea": subtotal_linea,
-                "Impuesto_Linea": impuesto_linea,
-                "Total_Linea": total_linea,
-                "Moneda": moneda,
-                "Pais": pais,
-                "Marca_Costo": "",
-                "Cuenta_Costo": "",
-                "Descripcion_Raw": s,
-            }
-        )
-
-    return items
+def is_gustavo_gamboa(text: str) -> bool:
+    t = (text or "").upper()
+    return "GUSTAVO GAMBOA VILLALOBOS" in t and "# DESCRIPCIÓN / CÓDIGO" in t
 
 
 # =========================
-# Header Parsers (Finanzas)
+# Header Parsers
 # =========================
-def parse_forlan_co_finance(text: str, filename: str) -> FinanceInvoice:
+def parse_forlan_co_header(text: str, filename: str) -> FinanceInvoice:
     scanned = looks_scanned(text)
     moneda, simbolo = detect_currency(text)
 
@@ -406,7 +268,6 @@ def parse_forlan_co_finance(text: str, filename: str) -> FinanceInvoice:
     factura_num = f"{prefijo} {consecutivo}".strip() if prefijo or consecutivo else ""
 
     fecha = find_first([r"Generaci[oó]n\s*([0-3]\d\/[01]\d\/[12]\d{3},\s*[0-2]\d:[0-5]\d)"], text)
-
     forma_pago = find_first([r"Forma\s+de\s+pago:\s*\n*([A-Za-zÁÉÍÓÚÑ\s]+)"], text)
     medio_pago = find_first([r"Medio\s+de\s+pago:\s*\n*([A-Za-zÁÉÍÓÚÑ\s\-]+)"], text)
 
@@ -416,7 +277,7 @@ def parse_forlan_co_finance(text: str, filename: str) -> FinanceInvoice:
 
     oc = find_first([r"Oc:\s*(OC[0-9]+)"], text)
     cufe = find_first([r"CUFE:\s*([a-f0-9]{20,})"], text)
-    resol = find_first([r"Resoluci[oó]n\s*(?:DIAN)?\s*[:\-]?\s*([0-9\-\/]+)"], text)
+    resol = find_first([r"Autorizaci[oó]n\s+Electr[oó]nica\s+([0-9]+)"], text)
     qr_hint = find_first([r"(CUFE:\s*[a-f0-9]{20,})"], text)
 
     return FinanceInvoice(
@@ -431,7 +292,6 @@ def parse_forlan_co_finance(text: str, filename: str) -> FinanceInvoice:
         Factura_Numero=factura_num,
         Consecutivo=consecutivo,
         Fecha_Emision=fecha,
-        Condicion_Venta="",
         Forma_Pago=forma_pago,
         Medio_Pago=medio_pago,
         Moneda=moneda or "COP",
@@ -444,12 +304,12 @@ def parse_forlan_co_finance(text: str, filename: str) -> FinanceInvoice:
         Resolucion_DIAN=resol,
         QR_o_Codigo=qr_hint,
         Probable_Escaneado="SI" if scanned else "NO",
-        Metodo_Extraccion="FORLAN CO (contabilidad + líneas)",
+        Metodo_Extraccion="FORLAN CO (header)",
         Error="",
     )
 
 
-def parse_navatec_cr_finance(text: str, filename: str) -> FinanceInvoice:
+def parse_navatec_cr_header(text: str, filename: str) -> FinanceInvoice:
     scanned = looks_scanned(text)
     moneda, simbolo = detect_currency(text)
 
@@ -495,19 +355,19 @@ def parse_navatec_cr_finance(text: str, filename: str) -> FinanceInvoice:
         Clave_Numerica=clave,
         Codigo_Unico_Consulta=cod_unico,
         Probable_Escaneado="SI" if scanned else "NO",
-        Metodo_Extraccion="NAVATEC CR (contabilidad + líneas)",
+        Metodo_Extraccion="NAVATEC CR (header)",
         Error="",
     )
 
 
-def parse_generic_finance(text: str, filename: str, pais_hint: str = "") -> FinanceInvoice:
+def parse_generic_header(text: str, filename: str, pais_hint: str = "") -> FinanceInvoice:
     scanned = looks_scanned(text)
     moneda, simbolo = detect_currency(text)
 
     proveedor = find_first(
         [
             r"Raz[oó]n\s+Social[:\s]+([A-ZÁÉÍÓÚÑ0-9&\-\.\s]{4,})",
-            r"Proveedor[:\s]+([A-ZÁÉÍÓÚÑ0-9&\-\.\s]{4,})",
+            r"Nombre:\s*([A-ZÁÉÍÓÚÑ0-9\.\s&\-]+)\n",
             r"Emisor[:\s]+([A-ZÁÉÍÓÚÑ0-9&\-\.\s]{4,})",
         ],
         text,
@@ -516,33 +376,30 @@ def parse_generic_finance(text: str, filename: str, pais_hint: str = "") -> Fina
     proveedor_id = find_first(
         [
             r"NIT[:\s]*([0-9\.\-]{6,20})",
-            r"N\.I\.T\.[:\s]*([0-9\.\-]{6,20})",
-            r"Ident\.\s*Jur[ií]dica:\s*([0-9\-]+)",
+            r"Identificaci[oó]n:\s*([0-9]+)",
             r"C[eé]dula:\s*([0-9]+)",
+            r"Ident\.\s*Jur[ií]dica:\s*([0-9\-]+)",
         ],
         text,
     )
 
     factura_num = find_first(
         [
-            r"Factura\s*(?:No\.|Nro\.|N°|#)?\s*[:\s]*([A-Z0-9\-]{3,})",
-            r"Invoice\s*(?:No\.|Number)?\s*[:\s]*([A-Z0-9\-]{3,})",
+            r"Factura\s+Electr[oó]nica[:\s#]*([0-9]{8,})",
             r"Consecutivo:\s*([0-9]+)",
+            r"Factura\s*(?:No\.|Nro\.|N°|#)?\s*[:\s]*([A-Z0-9\-]{3,})",
         ],
         text,
     )
 
     fecha = find_first(
         [
-            r"Fecha\s*(?:de\s*Emisi[oó]n)?[:\s]*([0-3]?\d[\/\-][01]?\d[\/\-][12]\d{3})",
-            r"Generaci[oó]n\s*([0-3]\d\/[01]\d\/[12]\d{3},\s*[0-2]\d:[0-5]\d)",
+            r"Fecha:\s*([0-3]\d\/[01]\d\/[12]\d{3}\s+[0-2]\d:[0-5]\d:[0-5]\d)",
+            r"Fecha\s+y\s+hora\s+de\s+emisi[oó]n:\s*([0-3]\d[\-\/][01]\d[\-\/][12]\d{3}\s+[0-2]\d:[0-5]\d:[0-5]\d\s*[ap]\.m\.)",
+            r"Fecha\s+de\s+emisi[oó]n:\s*([0-3]\d\/[01]\d\/[12]\d{3}\s*[0-2]?\d:[0-5]\d)",
         ],
         text,
     )
-
-    subtotal_str = find_first([r"Subtotal[:\s\$]*([0-9\.\,]+)", r"Total\s+Bruto\s*([0-9\.,]+)"], text)
-    iva_str = find_first([r"IVA[:\s\$]*([0-9\.\,]+)", r"Total\s+impuestos\s*([0-9\.,]+)"], text)
-    total_str = find_first([r"Total[:\s\$]*([0-9\.\,]+)", r"Total\s+a\s+Pagar\s*([0-9\.,]+)"], text)
 
     return FinanceInvoice(
         Documento=filename,
@@ -554,25 +411,451 @@ def parse_generic_finance(text: str, filename: str, pais_hint: str = "") -> Fina
         Fecha_Emision=fecha,
         Moneda=moneda,
         Simbolo_Moneda=simbolo,
-        Subtotal=parse_number_latam(subtotal_str),
-        Impuesto_IVA=parse_number_latam(iva_str),
-        Total_Factura=parse_number_latam(total_str),
         Probable_Escaneado="SI" if scanned else "NO",
-        Metodo_Extraccion="Genérico (contabilidad + líneas)",
+        Metodo_Extraccion="Genérico (header)",
         Error="",
     )
 
 
 # =========================
-# Excel Builder
+# Line Items Parsers (por formato)
 # =========================
+def items_forlan_co(text: str, inv: FinanceInvoice) -> List[Dict[str, Any]]:
+    """
+    FORLAN CO: filas tipo:
+      1 21147 15.00 SOLDADURA ELECTRICA ... 14,000.00 210,000.00 244,650.00
+    Columnas del PDF: Ítem, Código, Cantidad, Descripción, Vr Unitario, Vr Bruto, Vr Total 
+    """
+    out: List[Dict[str, Any]] = []
+    for ln in lines(text):
+        # Start: itemNo code qty ... end: unit bruto total
+        m = re.match(
+            r"^(?P<item>\d+)\s+(?P<codigo>\d{3,})\s+(?P<qty>\d+(?:\.\d+)?)\s+(?P<desc>.+?)\s+(?P<unit>[0-9\.,]+)\s+(?P<bruto>[0-9\.,]+)\s+(?P<total>[0-9\.,]+)\s*$",
+            ln
+        )
+        if not m:
+            continue
+
+        out.append({
+            "Factura_Numero": inv.Factura_Numero,
+            "Documento": inv.Documento,
+            "Linea": m.group("item"),
+            "Codigo_Item": m.group("codigo"),
+            "Descripcion": m.group("desc").strip(),
+            "Cantidad": parse_number_latam(m.group("qty")),
+            "Unidad": "",
+            "Precio_Unitario": parse_number_latam(m.group("unit")),
+            "Descuento": None,
+            "Subtotal_Linea": parse_number_latam(m.group("bruto")),
+            "Impuesto_Linea": None,  # en Forlan viene el % pero no el impuesto por línea
+            "Total_Linea": parse_number_latam(m.group("total")),
+            "Moneda": inv.Moneda,
+            "Pais": inv.Pais,
+            "Marca_Costo": "",
+            "Cuenta_Costo": "",
+            "Descripcion_Raw": ln,
+        })
+
+    return out
+
+
+def items_navatec_cr(text: str, inv: FinanceInvoice) -> List[Dict[str, Any]]:
+    """
+    NAVATEC: líneas tipo:
+      001 1.00 Unid MTR001 ... 741,300.84 0.00 741.300,84 96,369.11 
+    """
+    out: List[Dict[str, Any]] = []
+    pat = re.compile(
+        r"^(?P<linea>\d{3})\s+"
+        r"(?P<cantidad>\d+(?:\.\d+)?)\s+"
+        r"(?P<unidad>\w+)\s+"
+        r"(?P<codigo>[A-Z0-9]+)\s+"
+        r"(?P<desc>.+?)\s+"
+        r"(?P<precio>[0-9\.,]+)\s+"
+        r"(?P<descuento>[0-9\.,]+)\s+"
+        r"(?P<subtotal>[0-9\.,]+)\s+"
+        r"(?P<imp>[0-9\.,]+)\s*$"
+    )
+
+    for ln in lines(text):
+        m = pat.match(ln)
+        if not m:
+            continue
+
+        subtotal_linea = parse_number_latam(m.group("subtotal"))
+        imp = parse_number_latam(m.group("imp"))
+        total_linea = (subtotal_linea + imp) if (subtotal_linea is not None and imp is not None) else None
+
+        out.append({
+            "Factura_Numero": inv.Factura_Numero,
+            "Documento": inv.Documento,
+            "Linea": m.group("linea"),
+            "Codigo_Item": m.group("codigo"),
+            "Descripcion": m.group("desc").strip(),
+            "Cantidad": parse_number_latam(m.group("cantidad")),
+            "Unidad": m.group("unidad"),
+            "Precio_Unitario": parse_number_latam(m.group("precio")),
+            "Descuento": parse_number_latam(m.group("descuento")),
+            "Subtotal_Linea": subtotal_linea,
+            "Impuesto_Linea": imp,
+            "Total_Linea": total_linea,
+            "Moneda": inv.Moneda,
+            "Pais": inv.Pais,
+            "Marca_Costo": "",
+            "Cuenta_Costo": "",
+            "Descripcion_Raw": ln,
+        })
+
+    return out
+
+
+def items_tribu_hacienda_cr(text: str, inv: FinanceInvoice) -> List[Dict[str, Any]]:
+    """
+    TRIBU-CR / Hacienda: en página 2:
+      Línea Código Detalle del Producto
+      1 8419000000000 REPARACION VEHICULO MECANICO
+      1,00 Unidad 20.000,00 ... 0,00 22.600,00 
+    """
+    out: List[Dict[str, Any]] = []
+    ln_list = lines(text)
+
+    i = 0
+    while i < len(ln_list):
+        ln = ln_list[i]
+        m = re.match(r"^(?P<linea>\d+)\s+(?P<codigo>\d{10,})\s+(?P<desc>.+)$", ln)
+        if not m:
+            i += 1
+            continue
+
+        linea = m.group("linea")
+        codigo = m.group("codigo")
+        desc = m.group("desc").strip()
+
+        # busca la siguiente línea con cantidad/unidad/precio/total
+        j = i + 1
+        blob = ""
+        while j < len(ln_list):
+            if ln_list[j].upper().startswith("OBSERVACIONES"):
+                break
+            # siguiente item?
+            if re.match(r"^\d+\s+\d{10,}\s+", ln_list[j]):
+                break
+            blob += " " + ln_list[j]
+            j += 1
+
+        # En blob buscamos: qty unit price monto descuento total (el orden varía por saltos)
+        # Nos quedamos con los últimos 4 números como: precio/monto/descuento/total (heurístico)
+        nums = re.findall(r"[0-9]{1,3}(?:[0-9\.,]*[0-9])", blob)
+        # qty tiene coma decimal (1,00)
+        qty = find_first([r"(\d+,\d+)\s+Unidad", r"(\d+,\d+)\s+Servicios", r"(\d+,\d+)\s+\w+"], blob)
+
+        # toma los últimos 4 números del blob como [precio, monto, descuento, total] si existen
+        precio = monto = descuento = total = None
+        if len(nums) >= 4:
+            precio = parse_number_latam(nums[-4])
+            monto = parse_number_latam(nums[-3])
+            descuento = parse_number_latam(nums[-2])
+            total = parse_number_latam(nums[-1])
+
+        out.append({
+            "Factura_Numero": inv.Factura_Numero,
+            "Documento": inv.Documento,
+            "Linea": linea,
+            "Codigo_Item": codigo,
+            "Descripcion": desc,
+            "Cantidad": parse_number_latam(qty),
+            "Unidad": "Unidad",
+            "Precio_Unitario": precio,
+            "Descuento": descuento,
+            "Subtotal_Linea": monto,
+            "Impuesto_Linea": None,
+            "Total_Linea": total,
+            "Moneda": inv.Moneda,
+            "Pais": inv.Pais,
+            "Marca_Costo": "",
+            "Cuenta_Costo": "",
+            "Descripcion_Raw": (ln + " | " + blob.strip())[:1000],
+        })
+
+        i = j
+    return out
+
+
+def items_ciclo_huracan(text: str, inv: FinanceInvoice) -> List[Dict[str, Any]]:
+    """
+    CICLO HURACAN:
+      1 04692 BINOCULAR 8X21
+      1.00 Unid CRC 10,619.46903 ... CRC 12,000.00 :contentReference[oaicite:9]{index=9}
+    """
+    out: List[Dict[str, Any]] = []
+    ln_list = lines(text)
+
+    i = 0
+    while i < len(ln_list):
+        ln = ln_list[i]
+        m = re.match(r"^(?P<linea>\d+)\s+(?P<codigo>\d+)\s+(?P<desc>.+)$", ln)
+        if not m:
+            i += 1
+            continue
+
+        linea = m.group("linea")
+        codigo = m.group("codigo")
+        desc = m.group("desc").strip()
+
+        # Captura siguiente bloque con cantidades y valores
+        blob = ""
+        j = i + 1
+        while j < len(ln_list):
+            if ln_list[j].upper().startswith("COMENTARIO") or ln_list[j].upper().startswith("COMENTARIO:"):
+                break
+            if re.match(r"^\d+\s+\d+\s+", ln_list[j]):
+                break
+            blob += " " + ln_list[j]
+            j += 1
+
+        qty = find_first([r"(\d+(?:\.\d+)?)\s+Unid"], blob)
+        # valores: precio, impuesto, total (en texto aparece IVA 13% CRC 1,380.53 CRC 12,000.00)
+        precio = find_first([r"CRC\s*([0-9\.,]+)"], blob)
+        total = find_first([r"CRC\s*([0-9\.,]+)\s*$"], blob)
+
+        # impuesto: busca "CRC x,xxx.xx" antes del total
+        imp = None
+        m_imp = re.search(r"IVA\s*13%.*?CRC\s*([0-9\.,]+)", blob, re.IGNORECASE)
+        if m_imp:
+            imp = parse_number_latam(m_imp.group(1))
+
+        out.append({
+            "Factura_Numero": inv.Factura_Numero,
+            "Documento": inv.Documento,
+            "Linea": linea,
+            "Codigo_Item": codigo,
+            "Descripcion": desc,
+            "Cantidad": parse_number_latam(qty),
+            "Unidad": "Unid",
+            "Precio_Unitario": parse_number_latam(precio),
+            "Descuento": 0.0,
+            "Subtotal_Linea": None,
+            "Impuesto_Linea": imp,
+            "Total_Linea": parse_number_latam(total),
+            "Moneda": inv.Moneda,
+            "Pais": inv.Pais,
+            "Marca_Costo": "",
+            "Cuenta_Costo": "",
+            "Descripcion_Raw": (ln + " | " + blob.strip())[:1000],
+        })
+
+        i = j
+    return out
+
+
+def items_brujo_caribeno(text: str, inv: FinanceInvoice) -> List[Dict[str, Any]]:
+    """
+    EL BRUJO CARIBEÑO:
+      C01 Al 1.00 300,000.00 0.00 300,000.00 39,000.00 (descr arriba) :contentReference[oaicite:10]{index=10}
+    """
+    out: List[Dict[str, Any]] = []
+    ln_list = lines(text)
+
+    # intenta capturar descripción larga anterior a la línea numérica
+    last_desc = ""
+    for ln in ln_list:
+        if "Servicios de alquiler" in ln:
+            last_desc = ln.strip()
+
+        m = re.match(r"^(?P<codigo>[A-Z0-9]+)\s+(?P<unidad>\w+)\s+(?P<qty>\d+(?:\.\d+)?)\s+(?P<precio>[0-9\.,]+)\s+(?P<descnt>[0-9\.,]+)\s+(?P<subt>[0-9\.,]+)\s+(?P<imp>[0-9\.,]+)\s*$", ln)
+        if not m:
+            continue
+
+        subtotal = parse_number_latam(m.group("subt"))
+        imp = parse_number_latam(m.group("imp"))
+        total = (subtotal + imp) if (subtotal is not None and imp is not None) else None
+
+        out.append({
+            "Factura_Numero": inv.Factura_Numero,
+            "Documento": inv.Documento,
+            "Linea": "1",
+            "Codigo_Item": m.group("codigo"),
+            "Descripcion": last_desc or "SERVICIO",
+            "Cantidad": parse_number_latam(m.group("qty")),
+            "Unidad": m.group("unidad"),
+            "Precio_Unitario": parse_number_latam(m.group("precio")),
+            "Descuento": parse_number_latam(m.group("descnt")),
+            "Subtotal_Linea": subtotal,
+            "Impuesto_Linea": imp,
+            "Total_Linea": total,
+            "Moneda": inv.Moneda,
+            "Pais": inv.Pais,
+            "Marca_Costo": "",
+            "Cuenta_Costo": "",
+            "Descripcion_Raw": ln,
+        })
+    return out
+
+
+def items_erial_office_depot(text: str, inv: FinanceInvoice) -> List[Dict[str, Any]]:
+    """
+    ERIAL BQ (Office Depot): líneas tipo:
+      1 3212900039900 ... 1.00 Unid 876.11 876.11 113.89 13.00 0.00 990.00 :contentReference[oaicite:11]{index=11}
+    """
+    out: List[Dict[str, Any]] = []
+    for ln in lines(text):
+        m = re.match(
+            r"^(?P<linea>\d+)\s+(?P<sku>\d{10,})\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:\.\d+)?)\s+(?P<uni>\w+)\s+(?P<pu>[0-9\.,]+)\s+(?P<subt>[0-9\.,]+)\s+(?P<imp>[0-9\.,]+)\s+(?P<pct>[0-9\.,]+)\s+(?P<descnt>[0-9\.,]+)\s+(?P<total>[0-9\.,]+)\s*$",
+            ln
+        )
+        if not m:
+            continue
+
+        out.append({
+            "Factura_Numero": inv.Factura_Numero,
+            "Documento": inv.Documento,
+            "Linea": m.group("linea"),
+            "Codigo_Item": m.group("sku"),
+            "Descripcion": m.group("desc").strip(),
+            "Cantidad": parse_number_latam(m.group("qty")),
+            "Unidad": m.group("uni"),
+            "Precio_Unitario": parse_number_latam(m.group("pu")),
+            "Descuento": parse_number_latam(m.group("descnt")),
+            "Subtotal_Linea": parse_number_latam(m.group("subt")),
+            "Impuesto_Linea": parse_number_latam(m.group("imp")),
+            "Total_Linea": parse_number_latam(m.group("total")),
+            "Moneda": inv.Moneda,
+            "Pais": inv.Pais,
+            "Marca_Costo": "",
+            "Cuenta_Costo": "",
+            "Descripcion_Raw": ln,
+        })
+    return out
+
+
+def items_gustavo_gamboa(text: str, inv: FinanceInvoice) -> List[Dict[str, Any]]:
+    """
+    Gustavo Gamboa: líneas tipo:
+      1 RU1487 SECTOR CONCEPCION 1.00 837,405.00 Serv Prof 0.00 13.00 % I.V.A 108,862.65 946,267.65 :contentReference[oaicite:12]{index=12}
+    """
+    out: List[Dict[str, Any]] = []
+    for ln in lines(text):
+        m = re.match(
+            r"^(?P<linea>\d+)\s+(?P<codigo>[A-Z0-9]+)\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:\.\d+)?)\s+(?P<precio>[0-9\.,]+)\s+(?P<uni>Serv\s+Prof|\w+)\s+(?P<descnt>[0-9\.,]+)\s+(?P<pct>[0-9\.,]+)\s+%.*?\s+(?P<imp>[0-9\.,]+)\s+(?P<total>[0-9\.,]+)\s*$",
+            ln,
+            re.IGNORECASE
+        )
+        if not m:
+            continue
+
+        total = parse_number_latam(m.group("total"))
+        imp = parse_number_latam(m.group("imp"))
+        subtotal = (total - imp) if (total is not None and imp is not None) else None
+
+        out.append({
+            "Factura_Numero": inv.Factura_Numero,
+            "Documento": inv.Documento,
+            "Linea": m.group("linea"),
+            "Codigo_Item": m.group("codigo"),
+            "Descripcion": m.group("desc").strip(),
+            "Cantidad": parse_number_latam(m.group("qty")),
+            "Unidad": m.group("uni").strip(),
+            "Precio_Unitario": parse_number_latam(m.group("precio")),
+            "Descuento": parse_number_latam(m.group("descnt")),
+            "Subtotal_Linea": subtotal,
+            "Impuesto_Linea": imp,
+            "Total_Linea": total,
+            "Moneda": inv.Moneda,
+            "Pais": inv.Pais,
+            "Marca_Costo": "",
+            "Cuenta_Costo": "",
+            "Descripcion_Raw": ln,
+        })
+    return out
+
+
+# =========================
+# Excel Formatting + Grouping
+# =========================
+def autosize_columns(ws):
+    # autosize simple (cap 60)
+    for col_idx, col_cells in enumerate(ws.columns, start=1):
+        max_len = 0
+        for cell in col_cells:
+            val = "" if cell.value is None else str(cell.value)
+            if len(val) > max_len:
+                max_len = len(val)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 60)
+
+
+def apply_global_excel_formatting(wb):
+    font = Font(name="Century Gothic", size=10)
+
+    for ws in wb.worksheets:
+        # Disable gridlines
+        ws.sheet_view.showGridLines = False
+
+        # Apply font to used range
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.font = font
+
+        # Freeze header row
+        ws.freeze_panes = "A2"
+
+        # Autofilter
+        ws.auto_filter.ref = ws.dimensions
+
+        # Autosize
+        autosize_columns(ws)
+
+
+def group_line_items_by_invoice(ws, factura_col_letter: str = "A"):
+    """
+    Agrupa filas por Factura_Numero (col A en LINEAS_FACTURA)
+    """
+    ws.sheet_properties.outlinePr.summaryBelow = True
+    ws.sheet_view.showOutlineSymbols = True
+
+    # lee valores desde fila 2
+    current = None
+    start_row = None
+
+    max_row = ws.max_row
+    for r in range(2, max_row + 1):
+        val = ws[f"{factura_col_letter}{r}"].value
+        if val != current:
+            # cerrar grupo anterior
+            if current is not None and start_row is not None:
+                end_row = r - 1
+                if end_row > start_row:
+                    ws.row_dimensions.group(start_row, end_row, outline_level=1, hidden=False)
+            # abrir nuevo
+            current = val
+            start_row = r
+
+    # cerrar último
+    if current is not None and start_row is not None:
+        end_row = max_row
+        if end_row > start_row:
+            ws.row_dimensions.group(start_row, end_row, outline_level=1, hidden=False)
+
+
 def build_excel_bytes(df_fin: pd.DataFrame, df_lines: pd.DataFrame, df_audit: pd.DataFrame) -> bytes:
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         df_fin.to_excel(writer, index=False, sheet_name="FINANZAS_FACTURAS")
         df_lines.to_excel(writer, index=False, sheet_name="LINEAS_FACTURA")
         df_audit.to_excel(writer, index=False, sheet_name="AUDITORIA_TEXTO")
-    return out.getvalue()
+
+    out.seek(0)
+    wb = load_workbook(out)
+
+    apply_global_excel_formatting(wb)
+
+    # Agrupar en LINEAS_FACTURA por Factura_Numero (columna A)
+    if "LINEAS_FACTURA" in wb.sheetnames:
+        ws = wb["LINEAS_FACTURA"]
+        group_line_items_by_invoice(ws, factura_col_letter="A")
+
+    final = io.BytesIO()
+    wb.save(final)
+    return final.getvalue()
 
 
 # =========================
@@ -615,71 +898,61 @@ if process:
 
         try:
             text = extract_text_pypdf(pdf_bytes)
-            moneda, _ = detect_currency(text)
 
-            # Encabezado + Líneas según tipo
+            # Header
             if is_forlan_co(text):
-                inv = parse_forlan_co_finance(text, uf.name)
-                items = extract_items_generic(text, uf.name, inv.Pais, inv.Moneda)  # Forlan: best-effort
+                inv = parse_forlan_co_header(text, uf.name)
+                inv.Metodo_Extraccion = "FORLAN CO (header + líneas)"
+                items = items_forlan_co(text, inv)
             elif is_navatec_cr(text):
-                inv = parse_navatec_cr_finance(text, uf.name)
-                items = extract_items_navatec(text, uf.name, inv.Pais, inv.Moneda)  # NAVATEC: sólido
-            elif is_gustavo_cr(text) or is_hacienda_tribu_cr(text):
-                # Para estos CR, por ahora líneas genéricas (si aparecen)
-                inv = parse_generic_finance(text, uf.name, pais_hint="CR")
-                inv.Metodo_Extraccion = "CR (genérico) contabilidad + líneas"
-                items = extract_items_generic(text, uf.name, inv.Pais or "CR", inv.Moneda or (moneda or "CRC"))
+                inv = parse_navatec_cr_header(text, uf.name)
+                inv.Metodo_Extraccion = "NAVATEC CR (header + líneas)"
+                items = items_navatec_cr(text, inv)
+            elif is_tribu_cr_hacienda(text):
+                inv = parse_generic_header(text, uf.name, pais_hint="CR")
+                inv.Pais = "CR"
+                inv.Metodo_Extraccion = "TRIBU-CR (header + líneas)"
+                items = items_tribu_hacienda_cr(text, inv)
+            elif is_ciclo_huracan(text):
+                inv = parse_generic_header(text, uf.name, pais_hint="CR")
+                inv.Pais = "CR"
+                inv.Metodo_Extraccion = "CICLO HURACAN (header + líneas)"
+                items = items_ciclo_huracan(text, inv)
+            elif is_brujo_caribeno(text):
+                inv = parse_generic_header(text, uf.name, pais_hint="CR")
+                inv.Pais = "CR"
+                inv.Metodo_Extraccion = "EL BRUJO CARIBEÑO (header + líneas)"
+                items = items_brujo_caribeno(text, inv)
+            elif is_erial_office_depot(text):
+                inv = parse_generic_header(text, uf.name, pais_hint="CR")
+                inv.Pais = "CR"
+                inv.Metodo_Extraccion = "ERIAL BQ (header + líneas)"
+                items = items_erial_office_depot(text, inv)
+            elif is_gustavo_gamboa(text):
+                inv = parse_generic_header(text, uf.name, pais_hint="CR")
+                inv.Pais = "CR"
+                inv.Metodo_Extraccion = "GUSTAVO GAMBOA (header + líneas)"
+                items = items_gustavo_gamboa(text, inv)
             else:
-                inv = parse_generic_finance(text, uf.name)
-                items = extract_items_generic(text, uf.name, inv.Pais, inv.Moneda)
+                inv = parse_generic_header(text, uf.name)
+                inv.Metodo_Extraccion = "Genérico (header + líneas)"
+                items = []  # si es genérico, evitamos crear filas vacías sin intentar algo riesgoso
 
-            # Garantiza columnas fijas del encabezado
-            row = inv.__dict__
-            fin_rows.append({c: row.get(c, "") for c in FIN_COLS})
+            # Encabezado (si faltan moneda/símbolo por genérico, intenta inferir)
+            if not inv.Moneda:
+                inv.Moneda, inv.Simbolo_Moneda = detect_currency(text)
 
-            # Líneas
+            fin_row = inv.__dict__
+            fin_rows.append({c: fin_row.get(c, "") for c in FIN_COLS})
+
+            # Líneas: si no hay líneas, solo 1 fila con SIN_LINEAS_DETECTADAS (pero con Factura_Numero)
             if items:
                 for it in items:
                     line_rows.append({c: it.get(c, "") for c in LINE_COLS})
             else:
-                # si no detecta líneas, deja una fila "vacía" para no perder trazabilidad
-                line_rows.append(
-                    {
-                        "Documento": uf.name,
-                        "Linea": "",
-                        "Codigo_Item": "",
-                        "Descripcion": "",
-                        "Cantidad": None,
-                        "Unidad": "",
-                        "Precio_Unitario": None,
-                        "Descuento": None,
-                        "Subtotal_Linea": None,
-                        "Impuesto_Linea": None,
-                        "Total_Linea": None,
-                        "Moneda": inv.Moneda,
-                        "Pais": inv.Pais,
-                        "Marca_Costo": "",
-                        "Cuenta_Costo": "",
-                        "Descripcion_Raw": "NO_SE_DETECTARON_LINEAS",
-                    }
-                )
-
-            # Auditoría
-            if show_audit:
-                audit_rows.append(
-                    {"Documento": uf.name, "Longitud_Texto": len(text), "Texto": (text or "")[:max_audit_chars]}
-                )
-
-        except Exception as e:
-            err_row = {c: "" for c in FIN_COLS}
-            err_row["Documento"] = uf.name
-            err_row["Metodo_Extraccion"] = "ERROR"
-            err_row["Error"] = str(e)
-            fin_rows.append(err_row)
-
-            line_rows.append(
-                {
-                    "Documento": uf.name,
+                line_rows.append({
+                    "Factura_Numero": inv.Factura_Numero,
+                    "Documento": inv.Documento,
                     "Linea": "",
                     "Codigo_Item": "",
                     "Descripcion": "",
@@ -690,13 +963,47 @@ if process:
                     "Subtotal_Linea": None,
                     "Impuesto_Linea": None,
                     "Total_Linea": None,
-                    "Moneda": "",
-                    "Pais": "",
+                    "Moneda": inv.Moneda,
+                    "Pais": inv.Pais,
                     "Marca_Costo": "",
                     "Cuenta_Costo": "",
-                    "Descripcion_Raw": f"ERROR: {e}",
-                }
-            )
+                    "Descripcion_Raw": "SIN_LINEAS_DETECTADAS",
+                })
+
+            # Auditoría
+            if show_audit:
+                audit_rows.append({
+                    "Documento": uf.name,
+                    "Longitud_Texto": len(text),
+                    "Texto": (text or "")[:max_audit_chars],
+                })
+
+        except Exception as e:
+            err_row = {c: "" for c in FIN_COLS}
+            err_row["Documento"] = uf.name
+            err_row["Metodo_Extraccion"] = "ERROR"
+            err_row["Error"] = str(e)
+            fin_rows.append(err_row)
+
+            line_rows.append({
+                "Factura_Numero": "",
+                "Documento": uf.name,
+                "Linea": "",
+                "Codigo_Item": "",
+                "Descripcion": "",
+                "Cantidad": None,
+                "Unidad": "",
+                "Precio_Unitario": None,
+                "Descuento": None,
+                "Subtotal_Linea": None,
+                "Impuesto_Linea": None,
+                "Total_Linea": None,
+                "Moneda": "",
+                "Pais": "",
+                "Marca_Costo": "",
+                "Cuenta_Costo": "",
+                "Descripcion_Raw": f"ERROR: {e}",
+            })
 
             if show_audit:
                 audit_rows.append({"Documento": uf.name, "Longitud_Texto": 0, "Texto": f"ERROR: {e}"})
@@ -706,7 +1013,12 @@ if process:
     status.success("✅ Proceso finalizado. Generando Excel…")
 
     df_fin = pd.DataFrame(fin_rows, columns=FIN_COLS)
+
+    # Ordenamos líneas por Factura_Numero para que el agrupado quede perfecto
     df_lines = pd.DataFrame(line_rows, columns=LINE_COLS)
+    df_lines["Factura_Numero"] = df_lines["Factura_Numero"].fillna("")
+    df_lines = df_lines.sort_values(by=["Factura_Numero", "Documento", "Linea"], kind="stable").reset_index(drop=True)
+
     df_audit = pd.DataFrame(audit_rows) if show_audit else pd.DataFrame(columns=["Documento", "Longitud_Texto", "Texto"])
 
     st.subheader("Vista previa (FINANZAS_FACTURAS)")
@@ -715,18 +1027,11 @@ if process:
     st.subheader("Vista previa (LINEAS_FACTURA)")
     st.dataframe(df_lines.head(200), use_container_width=True)
 
-    scanned_count = (df_fin["Probable_Escaneado"] == "SI").sum()
-    if scanned_count:
-        st.warning(
-            f"Detecté **{scanned_count}** PDF(s) con muy poco texto (probablemente escaneados). "
-            "Sin OCR, las líneas podrían salir vacías."
-        )
-
     excel_bytes = build_excel_bytes(df_fin, df_lines, df_audit)
     filename = f"SED_Facturas_ContabilidadCO_Lineas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
     st.download_button(
-        "⬇️ Descargar Excel (Encabezado + Líneas)",
+        "⬇️ Descargar Excel (Encabezado + Líneas, Formato Contabilidad)",
         data=excel_bytes,
         file_name=filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
